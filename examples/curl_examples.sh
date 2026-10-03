@@ -498,3 +498,76 @@ curl -sS -X POST "$BASE/trips/$CTRIP/manifest/precheck" \
        \"unloaded_at\": \"2026-09-30T20:00:00+08:00\"}
     ]
   }"; echo
+
+echo "================ 本轮新增：装卸时段更正 ================"
+
+echo "50) 更正 $CTRIP 上 $CC1 的装卸窗口（首登 09:00-18:00 -> 10:00-19:00）"
+echo "    只改该条窗口：车次 / 货物归属与窗口身份（registered_loaded_at=09:00）不变"
+curl -sS -X POST "$BASE/trips/$CTRIP/loading-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"lc-demo-1\",
+    \"cargo_id\": \"$CC1\",
+    \"loaded_at\": \"2026-09-30T09:00:00+08:00\",
+    \"expected_version\": 0,
+    \"new_loaded_at\": \"2026-09-30T10:00:00+08:00\",
+    \"new_unloaded_at\": \"2026-09-30T19:00:00+08:00\",
+    \"reason\": \"装车单与 GPS 轨迹复核：实际 10:00 装车、19:00 卸货\"
+  }" | python3 -m json.tool
+
+echo "51) 同更正编号同请求重传 -> 200 replayed=true（返回原结果，不重复落库）"
+curl -sS -X POST "$BASE/trips/$CTRIP/loading-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"lc-demo-1\",
+    \"cargo_id\": \"$CC1\",
+    \"loaded_at\": \"2026-09-30T09:00:00+08:00\",
+    \"expected_version\": 0,
+    \"new_loaded_at\": \"2026-09-30T10:00:00+08:00\",
+    \"new_unloaded_at\": \"2026-09-30T19:00:00+08:00\",
+    \"reason\": \"装车单与 GPS 轨迹复核：实际 10:00 装车、19:00 卸货\"
+  }" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    replayed =", d["replayed"], "| version =", d["window"]["version"])'
+
+echo "52) 车次详情展示当前窗口（10:00-19:00，身份列仍为首登 09:00，version=1）"
+curl -sS "$BASE/trips/$CTRIP" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("    revision =", d["revision"])
+for l in d["loadings"]:
+    print("    ", l["cargo_id"], l["loaded_at"], "->", l["unloaded_at"],
+          "| registered_loaded_at =", l["registered_loaded_at"], "| version =", l["version"])'
+
+echo "53) 原窗口与历次更正可追溯（loaded_at=首次登记装车时刻）"
+curl -sS -G "$BASE/trips/$CTRIP/cargo/$CC1/loading-corrections" \
+  --data-urlencode "loaded_at=2026-09-30T09:00:00+08:00" | python3 -m json.tool
+
+echo "54) 错误示例：版本过期 stale_version / 新时段非法 invalid_loading_window /"
+echo "    原窗口不存在 loading_window_not_found"
+curl -sS -X POST "$BASE/trips/$CTRIP/loading-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"lc-demo-stale\",
+    \"cargo_id\": \"$CC1\",
+    \"loaded_at\": \"2026-09-30T09:00:00+08:00\",
+    \"expected_version\": 0,
+    \"new_loaded_at\": \"2026-09-30T11:00:00+08:00\",
+    \"new_unloaded_at\": \"2026-09-30T20:00:00+08:00\",
+    \"reason\": \"仍按版本 0 提交（实际已为 1）\"
+  }"; echo
+curl -sS -X POST "$BASE/trips/$CTRIP/loading-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"lc-demo-bad\",
+    \"cargo_id\": \"$CC1\",
+    \"loaded_at\": \"2026-09-30T09:00:00+08:00\",
+    \"expected_version\": 1,
+    \"new_loaded_at\": \"2026-09-30T20:00:00+08:00\",
+    \"new_unloaded_at\": \"2026-09-30T11:00:00+08:00\",
+    \"reason\": \"起点晚于终点（非法）\"
+  }"; echo
+curl -sS -X POST "$BASE/trips/$CTRIP/loading-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"lc-demo-missing\",
+    \"cargo_id\": \"$CC1\",
+    \"loaded_at\": \"2026-09-29T09:00:00+08:00\",
+    \"expected_version\": 0,
+    \"new_loaded_at\": \"2026-09-29T10:00:00+08:00\",
+    \"new_unloaded_at\": \"2026-09-29T19:00:00+08:00\",
+    \"reason\": \"该首登装车时刻不存在窗口\"
+  }"; echo

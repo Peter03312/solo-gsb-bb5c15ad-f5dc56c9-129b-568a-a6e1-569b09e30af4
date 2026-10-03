@@ -310,7 +310,7 @@ class TripOut(BaseModel):
     revision: int = Field(
         ...,
         description="车次修订号（初始 0）：该车次的装卸登记、车载读数写入、"
-        "车载读数更正使其 +1；装卸前预检凭预期修订号做乐观并发校验",
+        "车载读数更正与装卸时段更正使其 +1；装卸前预检凭预期修订号做乐观并发校验",
     )
     created_at: datetime
 
@@ -344,6 +344,15 @@ class LoadingOut(BaseModel):
     cargo_id: str
     loaded_at: datetime
     unloaded_at: datetime
+    registered_loaded_at: datetime = Field(
+        ...,
+        description="窗口身份：该窗口首次登记时的装车时刻；装卸时段更正后仍保持"
+        "此值不变，凭（车次 + 货物 + 此时刻 + 期望版本）提交更正",
+    )
+    version: int = Field(
+        ...,
+        description="该装卸窗口的更正版本：0=原始登记，n>=1 表示已更正 n 次",
+    )
 
 
 class ManifestOut(BaseModel):
@@ -707,5 +716,118 @@ class CorrectionHistory(BaseModel):
     )
     version: int = Field(..., description="当前更正版本（无更正 / 目标不存在为 0）")
     corrections: list[CorrectionHistoryItem] = Field(
+        ..., description="历次更正（append-only），按版本升序"
+    )
+
+
+# ----------------------------------------------------- 装卸时段更正
+
+
+class LoadingCorrectionCreate(BaseModel):
+    """装卸时段更正提交：只改一条装卸窗口的起止，车次 / 货物归属不变。
+
+    车次编号取自路径参数；``loaded_at`` 为该窗口**首次登记时的装车时刻**
+    （窗口稳定身份，可在车次详情的 ``registered_loaded_at`` 获得）；
+    ``expected_version`` 为窗口当前更正版本（首次更正为 0）。
+    """
+
+    correction_id: str = Field(
+        ..., min_length=1, max_length=64, description="更正编号（客户端指定）"
+    )
+    cargo_id: str = Field(..., min_length=1, max_length=64, description="货物编号")
+    loaded_at: datetime = Field(
+        ...,
+        description="原窗口首次登记的装车时刻（窗口身份；建议带时区）",
+    )
+    expected_version: int = Field(
+        ...,
+        ge=0,
+        description="预期的窗口当前更正版本（首次更正为 0，随后为最新版本号）；"
+        "与当前版本不一致则拒绝（版本过期）",
+    )
+    new_loaded_at: datetime = Field(
+        ..., description="修正后的装载时刻（区间起点，含；建议带时区）"
+    )
+    new_unloaded_at: datetime = Field(
+        ..., description="修正后的卸载时刻（区间终点，不含；建议带时区）"
+    )
+    reason: str = Field(
+        ...,
+        min_length=1,
+        max_length=512,
+        description="更正原因（必填且非空）",
+    )
+
+
+class LoadingCorrectionOut(BaseModel):
+    """一条装卸时段更正记录（append-only）。"""
+
+    correction_id: str
+    trip_id: str
+    cargo_id: str
+    registered_loaded_at: datetime = Field(
+        ..., description="窗口身份：首次登记时的装车时刻（更正不改变）"
+    )
+    old_loaded_at: datetime = Field(..., description="更正前原装车时刻")
+    old_unloaded_at: datetime = Field(..., description="更正前原卸货时刻")
+    new_loaded_at: datetime = Field(..., description="更正后装车时刻")
+    new_unloaded_at: datetime = Field(..., description="更正后卸货时刻")
+    expected_version: int
+    version: int = Field(..., description="本次更正后的版本（= expected_version + 1）")
+    reason: str
+    created_at: datetime
+
+
+class LoadingWindowOut(BaseModel):
+    """更正后的当前装卸窗口（含窗口身份与当前更正版本）。"""
+
+    trip_id: str
+    cargo_id: str
+    loaded_at: datetime = Field(..., description="当前（更正后）装车时刻，含")
+    unloaded_at: datetime = Field(..., description="当前（更正后）卸货时刻，不含")
+    registered_loaded_at: datetime = Field(
+        ..., description="窗口身份：首次登记时的装车时刻"
+    )
+    version: int = Field(..., description="窗口当前更正版本（0=原始登记）")
+
+
+class LoadingCorrectionAck(BaseModel):
+    """装卸时段更正新写入回执：更正记录 + 更正后的当前窗口。"""
+
+    correction: LoadingCorrectionOut
+    window: LoadingWindowOut
+
+
+class LoadingCorrectionReplay(LoadingCorrectionAck):
+    """同更正编号同请求重传：返回原结果（幂等）。"""
+
+    replayed: bool = True
+    message: str
+
+
+class LoadingCorrectionHistoryItem(LoadingCorrectionOut):
+    """装卸窗口更正历史中的一条（结构同更正记录）。"""
+
+
+class LoadingCorrectionHistory(BaseModel):
+    """一条装卸窗口的原始登记窗口与历次更正（按版本升序）。"""
+
+    trip_id: str
+    cargo_id: str
+    registered_loaded_at: datetime = Field(
+        ..., description="查询的窗口身份（首次登记装车时刻）"
+    )
+    window_exists: bool = Field(..., description="该窗口当前是否存在")
+    original_window: LoadingWindowOut | None = Field(
+        ...,
+        description="原始登记窗口（首次录入的装卸时刻，版本 0）；窗口不存在为 null",
+    )
+    current_window: LoadingWindowOut | None = Field(
+        ..., description="当前窗口（最近一次更正后）；窗口不存在为 null"
+    )
+    version: int = Field(
+        ..., description="窗口当前更正版本（无更正 / 窗口不存在为 0）"
+    )
+    corrections: list[LoadingCorrectionHistoryItem] = Field(
         ..., description="历次更正（append-only），按版本升序"
     )

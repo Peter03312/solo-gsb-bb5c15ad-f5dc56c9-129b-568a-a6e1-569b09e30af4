@@ -304,3 +304,127 @@ def test_concurrent_own_event_correction_and_event_write_serialize(client):
     assert len(hist["corrections"]) == 1
     assert hist["version"] == 1
     assert client.get("/cargo/COC/report").json()["excursions"] == []
+
+
+def test_concurrent_loading_corrections_serialize(client):
+    """同一装卸窗口的并发更正经货物行锁 + 车次行锁串行：
+    只有一笔以 expected_version=0 成功（201），同编号重传幂等（200），
+    其余按版本过期（409）；最终窗口版本确定为 1，车次修订号只 +1 一次。
+    """
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CLC",
+            "started_at": "2026-01-01T08:00:00+00:00",
+            "temp_upper_limit": "5",
+            "initial_holder": "A",
+        },
+    )
+    assert client.post(
+        "/trips", json={"trip_id": "TL", "vehicle_no": "V"}
+    ).status_code == 201
+    assert client.post(
+        "/trips/TL/manifest",
+        json={"items": [{
+            "cargo_id": "CLC",
+            "loaded_at": "2026-01-01T09:00:00+00:00",
+            "unloaded_at": "2026-01-01T18:00:00+00:00",
+        }]},
+    ).status_code == 201
+
+    def submit(i):
+        # 全部以版本 0 并发：同编号 lc-same 有一笔成功、其余幂等；
+        # 其他编号在首笔成功后版本过期
+        return client.post(
+            "/trips/TL/loading-corrections",
+            json={
+                "correction_id": "lc-same" if i == 0 else f"lc-other{i}",
+                "cargo_id": "CLC",
+                "loaded_at": "2026-01-01T09:00:00+00:00",
+                "expected_version": 0,
+                "new_loaded_at": f"2026-01-01T10:0{i}:00+00:00",
+                "new_unloaded_at": "2026-01-01T19:00:00+00:00",
+                "reason": f"并发更正 {i}",
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        codes = list(pool.map(submit, range(6)))
+
+    assert 201 in codes
+    assert all(c in (200, 201, 409) for c in codes), codes
+    detail = client.get("/trips/TL").json()
+    # 登记 +1、恰好一次成功更正 +1 -> revision == 2
+    assert detail["revision"] == 2
+    w = detail["loadings"][0]
+    assert w["version"] == 1
+    assert w["registered_loaded_at"] == "2026-01-01T09:00:00Z"
+    hist = client.get(
+        "/trips/TL/cargo/CLC/loading-corrections",
+        params={"loaded_at": "2026-01-01T09:00:00Z"},
+    ).json()
+    assert len(hist["corrections"]) == 1
+
+
+def test_concurrent_loading_correction_and_manifest_serialize(client):
+    """装卸时段更正与同车次 / 同货物的装卸登记经行锁串行，不得产生重叠窗口。"""
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CLM",
+            "started_at": "2026-01-01T08:00:00+00:00",
+            "temp_upper_limit": "5",
+            "initial_holder": "A",
+        },
+    )
+    assert client.post(
+        "/trips", json={"trip_id": "TM", "vehicle_no": "V"}
+    ).status_code == 201
+    assert client.post(
+        "/trips/TM/manifest",
+        json={"items": [{
+            "cargo_id": "CLM",
+            "loaded_at": "2026-01-01T09:00:00+00:00",
+            "unloaded_at": "2026-01-01T12:00:00+00:00",
+        }]},
+    ).status_code == 201
+
+    def correct_window(_):
+        return client.post(
+            "/trips/TM/loading-corrections",
+            json={
+                "correction_id": "lc-move",
+                "cargo_id": "CLM",
+                "loaded_at": "2026-01-01T09:00:00+00:00",
+                "expected_version": 0,
+                "new_loaded_at": "2026-01-01T15:00:00+00:00",
+                "new_unloaded_at": "2026-01-01T18:00:00+00:00",
+                "reason": "下午才装车",
+            },
+        ).status_code
+
+    def register_overlap(_):
+        # 与“更正后窗口”15-18 重叠的直接登记，二者任一顺序都必须有一个失败：
+        # 登记先成功则更正重叠拒绝（409）；更正先成功则登记重叠拒绝（409）
+        return client.post(
+            "/trips/TM/manifest",
+            json={"items": [{
+                "cargo_id": "CLM",
+                "loaded_at": "2026-01-01T16:00:00+00:00",
+                "unloaded_at": "2026-01-01T17:00:00+00:00",
+            }]},
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        corr_codes = list(pool.map(correct_window, range(2)))
+        man_codes = list(pool.map(register_overlap, range(2)))
+
+    # 同内容更正并发：一笔 201 一笔 200
+    assert sorted(corr_codes) == [200, 201], corr_codes
+    # 与更正后窗口重叠的登记全部失败
+    assert man_codes and all(c == 409 for c in man_codes), man_codes
+    # 最终同货物窗口互不重叠：只有一条窗口（15-18）
+    loadings = client.get("/trips/TM").json()["loadings"]
+    assert [(l["loaded_at"], l["unloaded_at"]) for l in loadings] == [
+        ("2026-01-01T15:00:00Z", "2026-01-01T18:00:00Z")
+    ]

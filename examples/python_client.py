@@ -564,6 +564,57 @@ def main() -> None:
             ),
         )
 
+        # ==================== 装卸时段更正 ====================
+        # pre_a 在 TRUCK-PY-2 的首登窗口为 09:00-18:00；调度员核对单据后
+        # 凭“首登装车时刻 + 期望版本 + 修正后的带时区时刻 + 原因”更正为 10:00-19:00
+        correction_body = {
+            "correction_id": "py-lc-1",
+            "cargo_id": pre_a,
+            "loaded_at": "2026-09-30T09:00:00+08:00",  # 窗口身份：首登装车时刻
+            "expected_version": 0,
+            "new_loaded_at": "2026-09-30T10:00:00+08:00",
+            "new_unloaded_at": "2026-09-30T19:00:00+08:00",
+            "reason": "装车单与 GPS 轨迹复核：实际 10:00 装车、19:00 卸货",
+        }
+        show("装卸时段更正（201：只改该条窗口，车次 / 货物 / 窗口身份不变）",
+             api.post(f"/trips/{ptrip}/loading-corrections", json=correction_body))
+        show("同更正编号同请求重传（200 replayed=true，返回原结果）",
+             api.post(f"/trips/{ptrip}/loading-corrections", json=correction_body))
+
+        detail = api.get(f"/trips/{ptrip}").json()
+        win = next(l for l in detail["loadings"] if l["cargo_id"] == pre_a)
+        print(
+            "车次详情当前窗口：",
+            win["loaded_at"], "->", win["unloaded_at"],
+            "| registered_loaded_at =", win["registered_loaded_at"],
+            "| version =", win["version"], "| revision =", detail["revision"],
+        )
+
+        show(
+            "原窗口与历次更正（append-only，按版本升序）",
+            api.get(
+                f"/trips/{ptrip}/cargo/{pre_a}/loading-corrections",
+                params={"loaded_at": "2026-09-30T09:00:00+08:00"},
+            ),
+        )
+
+        # 期望版本仍按 0 提交（当前已为 1）-> 409 stale_version
+        show(
+            "期望版本过期（409 stale_version，不落部分变更）",
+            api.post(
+                f"/trips/{ptrip}/loading-corrections",
+                json={
+                    "correction_id": "py-lc-stale",
+                    "cargo_id": pre_a,
+                    "loaded_at": "2026-09-30T09:00:00+08:00",
+                    "expected_version": 0,
+                    "new_loaded_at": "2026-09-30T11:00:00+08:00",
+                    "new_unloaded_at": "2026-09-30T20:00:00+08:00",
+                    "reason": "仍按版本 0 提交",
+                },
+            ),
+        )
+
 
 if __name__ == "__main__":
     main()
