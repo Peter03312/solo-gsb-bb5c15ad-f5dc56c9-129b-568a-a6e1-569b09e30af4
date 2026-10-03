@@ -498,3 +498,111 @@ curl -sS -X POST "$BASE/trips/$CTRIP/manifest/precheck" \
        \"unloaded_at\": \"2026-09-30T20:00:00+08:00\"}
     ]
   }"; echo
+
+echo
+echo "================ 本轮新增：装卸时段更正（只改该条窗口） ================"
+# 自包含演示：一票货物登记在 LTRIP 上 09:00-18:00，录一笔 17:30 的车载读数；
+# 更正窗口为 08:00-17:00 后，17:30 的读数按当前窗口变为“已卸货、不适用”。
+LTRIP="TRUCK-LC-1"; LC="COLD-LC-1"
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$LC\",
+  \"started_at\": \"2026-09-30T06:00:00+08:00\",
+  \"temp_upper_limit\": \"4.0\",
+  \"initial_holder\": \"北京冷库\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips" -H 'Content-Type: application/json' -d "{
+  \"trip_id\": \"$LTRIP\", \"vehicle_no\": \"京B-冷LC1\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips/$LTRIP/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [
+    {\"cargo_id\": \"$LC\",
+     \"loaded_at\": \"2026-09-30T09:00:00+08:00\",
+     \"unloaded_at\": \"2026-09-30T18:00:00+08:00\"}
+  ]
+}" >/dev/null
+# 17:30 车载越温读数（旧窗口 09:00-18:00 内在车）
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-lc-1\", \"trip_id\": \"$LTRIP\",
+  \"read_at\": \"2026-09-30T17:30:00+08:00\", \"temperature\": \"7.0\"
+}" >/dev/null
+
+echo "50) 车次详情：当前窗口（含稳定身份 origin_loaded_at 与 window_version=0），"
+echo "    17:30 读数对 $LC on_board=true"
+curl -sS "$BASE/trips/$LTRIP" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("    revision =", d["revision"])
+print("    loading  =", d["loadings"][0])
+print("    reading application =", d["readings"][0]["applications"][0])'
+
+echo "51) 更正装卸窗口 09:00-18:00 -> 08:00-17:00（expected_version=0，带原因）"
+curl -sS -X POST "$BASE/trips/$LTRIP/loading-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"lc-1\",
+    \"cargo_id\": \"$LC\",
+    \"origin_loaded_at\": \"2026-09-30T09:00:00+08:00\",
+    \"expected_version\": 0,
+    \"new_loaded_at\": \"2026-09-30T08:00:00+08:00\",
+    \"new_unloaded_at\": \"2026-09-30T17:00:00+08:00\",
+    \"reason\": \"派车单登记装车时刻录晚 1 小时、卸车时刻录晚 1 小时\"
+  }" | python3 -m json.tool
+
+echo "52) 车次详情反映当前窗口：window_version=1、revision +1；17:30 读数已卸货（on_board=false，卸车时刻排除）"
+curl -sS "$BASE/trips/$LTRIP" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("    revision =", d["revision"])
+print("    loading  =", d["loadings"][0])
+print("    reading application =", d["readings"][0]["applications"][0])'
+
+echo "53) 原窗口与历次更正可追溯（按版本升序）"
+curl -sS -G "$BASE/trips/$LTRIP/loading-corrections" \
+  --data-urlencode "cargo_id=$LC" \
+  --data-urlencode "origin_loaded_at=2026-09-30T09:00:00+08:00" \
+  | python3 -m json.tool
+
+echo "54) 同更正编号同请求重传 -> 200 replayed（返回原结果）"
+curl -sS -X POST "$BASE/trips/$LTRIP/loading-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"lc-1\",
+    \"cargo_id\": \"$LC\",
+    \"origin_loaded_at\": \"2026-09-30T09:00:00+08:00\",
+    \"expected_version\": 0,
+    \"new_loaded_at\": \"2026-09-30T08:00:00+08:00\",
+    \"new_unloaded_at\": \"2026-09-30T17:00:00+08:00\",
+    \"reason\": \"派车单登记装车时刻录晚 1 小时、卸车时刻录晚 1 小时\"
+  }" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    replayed =", d.get("replayed"), "version =", d["version"])'
+
+echo "55) 错误示例：版本过期（当前 1 仍传 0）/ 编号异请求冲突 / 原窗口不存在 / 新时段非法"
+curl -sS -X POST "$BASE/trips/$LTRIP/loading-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"lc-stale\", \"cargo_id\": \"$LC\",
+    \"origin_loaded_at\": \"2026-09-30T09:00:00+08:00\",
+    \"expected_version\": 0,
+    \"new_loaded_at\": \"2026-09-30T08:30:00+08:00\",
+    \"new_unloaded_at\": \"2026-09-30T17:00:00+08:00\", \"reason\": \"过期\"
+  }"; echo
+curl -sS -X POST "$BASE/trips/$LTRIP/loading-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"lc-1\", \"cargo_id\": \"$LC\",
+    \"origin_loaded_at\": \"2026-09-30T09:00:00+08:00\",
+    \"expected_version\": 1,
+    \"new_loaded_at\": \"2026-09-30T08:30:00+08:00\",
+    \"new_unloaded_at\": \"2026-09-30T17:00:00+08:00\", \"reason\": \"不同请求\"
+  }"; echo
+curl -sS -X POST "$BASE/trips/$LTRIP/loading-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"lc-missing\", \"cargo_id\": \"$LC\",
+    \"origin_loaded_at\": \"2026-09-30T10:30:00+08:00\",
+    \"expected_version\": 0,
+    \"new_loaded_at\": \"2026-09-30T11:00:00+08:00\",
+    \"new_unloaded_at\": \"2026-09-30T12:00:00+08:00\", \"reason\": \"无此窗口\"
+  }"; echo
+curl -sS -X POST "$BASE/trips/$LTRIP/loading-corrections" \
+  -H 'Content-Type: application/json' -d "{
+    \"correction_id\": \"lc-bad\", \"cargo_id\": \"$LC\",
+    \"origin_loaded_at\": \"2026-09-30T09:00:00+08:00\",
+    \"expected_version\": 1,
+    \"new_loaded_at\": \"2026-09-30T17:00:00+08:00\",
+    \"new_unloaded_at\": \"2026-09-30T17:00:00+08:00\", \"reason\": \"非法时段\"
+  }"; echo

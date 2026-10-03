@@ -564,6 +564,77 @@ def main() -> None:
             ),
         )
 
+        # ----- 装卸时段更正（只改该条窗口）-----
+        print("\n########## 装卸时段更正 ##########")
+        ltrip, lc = "TRUCK-LC-PY", "COLD-LC-PY"
+        api.post("/cargo", json={
+            "cargo_id": lc, "started_at": "2026-09-30T06:00:00+08:00",
+            "temp_upper_limit": "4.0", "initial_holder": "北京冷库"})
+        api.post("/trips", json={"trip_id": ltrip, "vehicle_no": "京B-冷LCPY"})
+        # 原始窗口 09:00-18:00，录一笔 17:30 的车载越温读数（旧窗口内在车）
+        api.post(f"/trips/{ltrip}/manifest", json={"items": [{
+            "cargo_id": lc,
+            "loaded_at": "2026-09-30T09:00:00+08:00",
+            "unloaded_at": "2026-09-30T18:00:00+08:00"}]})
+        api.post("/vehicle-readings", json={
+            "reading_id": "vr-lc-py", "trip_id": ltrip,
+            "read_at": "2026-09-30T17:30:00+08:00", "temperature": "7.0"})
+        before = api.get(f"/trips/{ltrip}").json()
+        print("更正前：window_version =", before["loadings"][0]["window_version"],
+              "revision =", before["revision"],
+              "17:30 在车 =",
+              before["readings"][0]["applications"][0]["on_board"])
+
+        # 稳定身份：车次 + 货物 + 首次登记装车时刻；expected_version 取 window_version
+        corr_body = {
+            "correction_id": "lc-py-1",
+            "cargo_id": lc,
+            "origin_loaded_at": "2026-09-30T09:00:00+08:00",
+            "expected_version": 0,
+            "new_loaded_at": "2026-09-30T08:00:00+08:00",
+            "new_unloaded_at": "2026-09-30T17:00:00+08:00",
+            "reason": "派车单装卸时刻各录晚 1 小时",
+        }
+        show("更正装卸窗口 09:00-18:00 -> 08:00-17:00（201）",
+             api.post(f"/trips/{ltrip}/loading-corrections", json=corr_body))
+
+        after = api.get(f"/trips/{ltrip}").json()
+        print("更正后：当前窗口 =",
+              (after["loadings"][0]["loaded_at"],
+               after["loadings"][0]["unloaded_at"]),
+              "window_version =", after["loadings"][0]["window_version"],
+              "revision =", after["revision"])
+        print("17:30 读数按当前窗口已卸货（卸车时刻排除）：on_board =",
+              after["readings"][0]["applications"][0]["on_board"])
+
+        # 原窗口与历次更正可追溯
+        show("原窗口与历次更正（按版本升序）", api.get(
+            f"/trips/{ltrip}/loading-corrections",
+            params={"cargo_id": lc,
+                    "origin_loaded_at": "2026-09-30T09:00:00+08:00"}))
+
+        # 同更正编号同请求重传 -> 200 replayed；异请求 -> 409
+        show("同请求重传（200 replayed）",
+             api.post(f"/trips/{ltrip}/loading-corrections", json=corr_body))
+        show("同编号异请求（409 correction_id_conflict）",
+             api.post(f"/trips/{ltrip}/loading-corrections",
+                      json={**corr_body, "expected_version": 1,
+                            "reason": "另一个原因"}))
+        # 版本过期 / 原窗口不存在 / 新时段非法
+        show("版本过期（409 stale_window_version）",
+             api.post(f"/trips/{ltrip}/loading-corrections",
+                      json={**corr_body, "correction_id": "lc-py-stale"}))
+        show("原窗口不存在（404 loading_window_not_found）",
+             api.post(f"/trips/{ltrip}/loading-corrections", json={
+                 **corr_body, "correction_id": "lc-py-missing",
+                 "origin_loaded_at": "2026-09-30T10:30:00+08:00"}))
+        show("新时段非法（422 invalid_loading_window）",
+             api.post(f"/trips/{ltrip}/loading-corrections", json={
+                 **corr_body, "correction_id": "lc-py-bad",
+                 "expected_version": 1,
+                 "new_loaded_at": "2026-09-30T17:00:00+08:00",
+                 "new_unloaded_at": "2026-09-30T17:00:00+08:00"}))
+
 
 if __name__ == "__main__":
     main()

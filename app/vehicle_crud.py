@@ -19,7 +19,8 @@
 车次修订号与装卸前预检
 ----------------------
 车次行维护单调递增的 ``revision``（初始 0）：该车次的**装卸登记**、
-**车载读数写入**、**车载读数更正**在持车次行锁的同一事务内使其 +1。
+**车载读数写入**、**车载读数更正**与**装卸时段更正**在持车次行锁的
+同一事务内使其 +1。
 登记装卸前可先预检（``precheck_manifest``，只读）：按“既有装卸 ∪ 本批
 拟登记”输出各重叠时段的货物集合、温度上限差异、既有车载读数覆盖与
 潜在越温风险，并给出绑定车次修订号、涉及货物温度上限与读数版本的
@@ -243,8 +244,11 @@ def _register_manifest_tx(
             Loading(
                 trip_id=payload.trip_id,
                 cargo_id=cargo_id,
+                origin_loaded_at=lo,
                 loaded_at=lo,
                 unloaded_at=un,
+                origin_unloaded_at=un,
+                window_version=0,
             )
             for cargo_id, lo, un in norm
         ]

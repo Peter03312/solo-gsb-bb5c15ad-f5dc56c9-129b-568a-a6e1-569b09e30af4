@@ -16,6 +16,7 @@ from app import (
     chain,
     correction_crud,
     crud,
+    loading_correction_crud,
     responsibility,
     stance_crud,
     timeline,
@@ -48,6 +49,11 @@ from app.schemas import (
     IdempotentReplay,
     LatestStance,
     LoadingOut,
+    LoadingCorrectionAck,
+    LoadingCorrectionHistory,
+    LoadingCorrectionOut,
+    LoadingCorrectionReplay,
+    LoadingWindowCorrectionCreate,
     ManifestConfirmCreate,
     ManifestCreate,
     ManifestOut,
@@ -85,12 +91,95 @@ from app.timeutil import ensure_utc
 async def lifespan(app: FastAPI):
     # 生产中由 db/init.sql 建表；此处确保直接 uvicorn / sqlite 测试也可用
     Base.metadata.create_all(bind=engine)
-    # 既有数据卷升级：为车次表补齐修订号列（init.sql 只对全新数据卷生效）
     if engine.dialect.name == "postgresql":
         with engine.begin() as conn:
+            # 既有数据卷升级（init.sql 只对全新数据卷生效）
+            # 1) 为车次表补齐修订号列
             conn.exec_driver_sql(
                 "ALTER TABLE trip "
                 "ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 0"
+            )
+            # 2) loading 表加入装卸时段更正所需的稳定身份列 / 原始窗口 / 版本。
+            #    旧数据卷主键原为 (trip_id, cargo_id, loaded_at)：新列补齐并回填
+            #    后，把主键切换到稳定身份 (trip_id, cargo_id, origin_loaded_at)。
+            conn.exec_driver_sql(
+                "ALTER TABLE loading "
+                "ADD COLUMN IF NOT EXISTS origin_loaded_at TIMESTAMPTZ"
+            )
+            conn.exec_driver_sql(
+                "ALTER TABLE loading "
+                "ADD COLUMN IF NOT EXISTS origin_unloaded_at TIMESTAMPTZ"
+            )
+            conn.exec_driver_sql(
+                "ALTER TABLE loading "
+                "ADD COLUMN IF NOT EXISTS window_version INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.exec_driver_sql(
+                "UPDATE loading SET origin_loaded_at = loaded_at "
+                "WHERE origin_loaded_at IS NULL"
+            )
+            conn.exec_driver_sql(
+                "UPDATE loading SET origin_unloaded_at = unloaded_at "
+                "WHERE origin_unloaded_at IS NULL"
+            )
+            conn.exec_driver_sql(
+                """
+                DO $do$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'chk_loading_origin_window'
+                          AND conrelid = 'loading'::regclass
+                    ) THEN
+                        ALTER TABLE loading
+                            ADD CONSTRAINT chk_loading_origin_window
+                            CHECK (origin_loaded_at < origin_unloaded_at);
+                    END IF;
+                END $do$
+                """
+            )
+            conn.exec_driver_sql(
+                "ALTER TABLE loading DROP CONSTRAINT IF EXISTS loading_pkey"
+            )
+            conn.exec_driver_sql(
+                "ALTER TABLE loading "
+                "ADD PRIMARY KEY (trip_id, cargo_id, origin_loaded_at)"
+            )
+            # 3) 装卸时段更正表（新表，IF NOT EXISTS 兜底）
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS loading_correction (
+                    correction_id          VARCHAR(64)   PRIMARY KEY,
+                    trip_id                VARCHAR(64)   NOT NULL,
+                    cargo_id               VARCHAR(64)   NOT NULL,
+                    origin_loaded_at       TIMESTAMPTZ   NOT NULL,
+                    origin_unloaded_at     TIMESTAMPTZ   NOT NULL,
+                    previous_loaded_at     TIMESTAMPTZ   NOT NULL,
+                    previous_unloaded_at   TIMESTAMPTZ   NOT NULL,
+                    new_loaded_at          TIMESTAMPTZ   NOT NULL,
+                    new_unloaded_at        TIMESTAMPTZ   NOT NULL,
+                    expected_version       INTEGER       NOT NULL,
+                    version                INTEGER       NOT NULL,
+                    reason                 VARCHAR(512)  NOT NULL,
+                    created_at             TIMESTAMPTZ   NOT NULL DEFAULT now(),
+                    CONSTRAINT chk_loading_correction_shape CHECK (
+                        expected_version >= 0
+                        AND version >= 1
+                        AND new_loaded_at < new_unloaded_at
+                        AND origin_loaded_at < origin_unloaded_at
+                        AND char_length(reason) > 0
+                    )
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ux_loading_correction_window_version "
+                "ON loading_correction (trip_id, cargo_id, origin_loaded_at, version)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_loading_correction_window "
+                "ON loading_correction (trip_id, cargo_id, origin_loaded_at, created_at)"
             )
     yield
 
@@ -105,8 +194,11 @@ app = FastAPI(
         "登记装卸时段前可先对一批待装货物做温控兼容性预检（只读，输出各重叠时段"
         "分析与预检摘要），再凭预检摘要确认登记（车次修订号乐观并发，摘要过期"
         "拒绝，通过后沿用批量原子校验）。"
+        "装卸时段录错后可凭原车次/货物/首次登记装车时刻、期望版本、修正后的"
+        "带时区时刻与原因更正单条装卸窗口（只改该条窗口，append-only 可追溯，"
+        "车载适用性/越温/责任/质控按当前窗口重建，成功推进车次修订号）。"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -245,6 +337,18 @@ def list_trips(db: Session = Depends(get_db)) -> list[Trip]:
     return vehicle_crud.list_trips(db)
 
 
+def _loading_out(l: Loading) -> LoadingOut:
+    """一条装卸窗口的响应：当前窗口 + 稳定身份（首次登记装车时刻）+ 更正版本。"""
+    return LoadingOut(
+        trip_id=l.trip_id,
+        cargo_id=l.cargo_id,
+        origin_loaded_at=ensure_utc(l.origin_loaded_at),
+        loaded_at=ensure_utc(l.loaded_at),
+        unloaded_at=ensure_utc(l.unloaded_at),
+        window_version=l.window_version or 0,
+    )
+
+
 def _reading_out(
     r: VehicleReading,
     effective: tuple | None = None,
@@ -282,15 +386,7 @@ def register_manifest(
     result = vehicle_crud.register_manifest(db, payload)
     return ManifestOut(
         trip_id=result.trip_id,
-        items=[
-            LoadingOut(
-                trip_id=l.trip_id,
-                cargo_id=l.cargo_id,
-                loaded_at=l.loaded_at,
-                unloaded_at=l.unloaded_at,
-            )
-            for l in result.items
-        ],
+        items=[_loading_out(l) for l in result.items],
     )
 
 
@@ -394,15 +490,7 @@ def confirm_manifest(
     result = vehicle_crud.confirm_manifest(db, payload)
     return ManifestOut(
         trip_id=result.trip_id,
-        items=[
-            LoadingOut(
-                trip_id=l.trip_id,
-                cargo_id=l.cargo_id,
-                loaded_at=l.loaded_at,
-                unloaded_at=l.unloaded_at,
-            )
-            for l in result.items
-        ],
+        items=[_loading_out(l) for l in result.items],
     )
 
 
@@ -582,15 +670,7 @@ def get_trip_detail(trip_id: str, db: Session = Depends(get_db)) -> TripDetail:
         note=trip.note,
         revision=trip.revision,
         created_at=ensure_utc(trip.created_at),
-        loadings=[
-            LoadingOut(
-                trip_id=l.trip_id,
-                cargo_id=l.cargo_id,
-                loaded_at=ensure_utc(l.loaded_at),
-                unloaded_at=ensure_utc(l.unloaded_at),
-            )
-            for l in loadings
-        ],
+        loadings=[_loading_out(l) for l in loadings],
         readings=trip_readings,
     )
 
@@ -1181,6 +1261,187 @@ def list_reading_corrections(
         True,
         reading.temperature,
         rows,
+    )
+
+
+# ---------------------------------------------------------------- 装卸时段更正
+
+
+def _loading_correction_out(row) -> LoadingCorrectionOut:
+    return LoadingCorrectionOut(
+        correction_id=row.correction_id,
+        trip_id=row.trip_id,
+        cargo_id=row.cargo_id,
+        origin_loaded_at=ensure_utc(row.origin_loaded_at),
+        origin_unloaded_at=ensure_utc(row.origin_unloaded_at),
+        previous_loaded_at=ensure_utc(row.previous_loaded_at),
+        previous_unloaded_at=ensure_utc(row.previous_unloaded_at),
+        new_loaded_at=ensure_utc(row.new_loaded_at),
+        new_unloaded_at=ensure_utc(row.new_unloaded_at),
+        expected_version=row.expected_version,
+        version=row.version,
+        reason=row.reason,
+        created_at=ensure_utc(row.created_at),
+    )
+
+
+def _parse_origin_loaded_at(raw: str | None) -> datetime:
+    """解析定位旧窗口的“原装车时刻”查询参数：必须是带时区的 ISO 8601 时刻。"""
+    if raw is None:
+        raise crud.ApiError(
+            422,
+            "missing_parameter",
+            "缺少必填参数 origin_loaded_at：原窗口首次登记的带时区装车时刻",
+        )
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        raise crud.ApiError(
+            422,
+            "bad_loading_correction_shape",
+            f"参数 origin_loaded_at={raw!r} 不是合法的 ISO 8601 日期时间",
+        )
+    if parsed.tzinfo is None:
+        raise crud.ApiError(
+            422,
+            "timezone_required",
+            f"参数 origin_loaded_at={raw!r} 必须携带时区偏移"
+            "（如 2026-09-30T09:00:00+08:00）",
+        )
+    return ensure_utc(parsed)
+
+
+@app.post(
+    "/trips/{trip_id}/loading-corrections",
+    response_model=LoadingCorrectionAck,
+    status_code=201,
+    tags=["装卸时段更正"],
+    responses={
+        200: {
+            "model": LoadingCorrectionReplay,
+            "description": "同更正编号同请求重传：返回原结果（幂等）",
+        },
+        404: {"description": "车次 / 装卸窗口不存在"},
+        409: {"description": "版本过期 / 编号异请求冲突 / 更正后窗口重叠"},
+        422: {"description": "新时段非法（起点不早于终点 / 缺时区 / 原因为空）"},
+    },
+)
+def submit_loading_correction(
+    trip_id: str,
+    payload: LoadingWindowCorrectionCreate,
+    db: Session = Depends(get_db),
+):
+    """更正一条已登记的装卸时段（只改该条窗口的时间，不改车次 / 货物归属）。
+
+    被更正窗口由 ``cargo_id`` + ``origin_loaded_at``（首次登记装车时刻，车次
+    取自路径）按稳定身份定位；``expected_version`` 取车次详情中该窗口的
+    ``window_version``（首次更正为 0）。新窗口仍左闭右开且起点严格早于终点，
+    按“同一货物任意车次的当前时段不得重叠”校验时排除该条旧窗口，冲突整次
+    拒绝。成功后车载读数适用性（装车时刻纳入、卸车时刻排除）、越温报告、
+    责任确认、同时越温查询与车次详情一律按当前窗口重建，车次修订号 +1，
+    旧装卸预检摘要失效。同更正编号同请求重传返回原结果，异请求冲突。
+    """
+    # 三个时刻必须显式携带时区偏移（本轮接口的强约束）
+    for field in ("origin_loaded_at", "new_loaded_at", "new_unloaded_at"):
+        value = getattr(payload, field)
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise crud.ApiError(
+                422,
+                "timezone_required",
+                f"字段 {field} 必须携带时区偏移（如 2026-09-30T09:00:00+08:00）",
+            )
+    payload.origin_loaded_at = ensure_utc(payload.origin_loaded_at)
+    payload.new_loaded_at = ensure_utc(payload.new_loaded_at)
+    payload.new_unloaded_at = ensure_utc(payload.new_unloaded_at)
+    if payload.new_loaded_at >= payload.new_unloaded_at:
+        raise crud.ApiError(
+            422,
+            "invalid_loading_window",
+            f"车次 {trip_id} 货物 {payload.cargo_id} 更正后的装卸时段 "
+            f"[{payload.new_loaded_at.isoformat()}, "
+            f"{payload.new_unloaded_at.isoformat()}) 无效："
+            "装载时段必须左闭右开且起点严格早于终点",
+        )
+    result = loading_correction_crud.submit_loading_correction(db, trip_id, payload)
+    ack = LoadingCorrectionAck(
+        correction=_loading_correction_out(result.correction),
+        loaded_at=result.loaded_at,
+        unloaded_at=result.unloaded_at,
+        origin_loaded_at=result.origin_loaded_at,
+        origin_unloaded_at=result.origin_unloaded_at,
+        version=result.version,
+        affected_cargo_ids=[result.cargo_id],
+    )
+    if result.replayed:
+        return JSONResponse(
+            status_code=200,
+            content=LoadingCorrectionReplay(
+                **ack.model_dump(mode="json"),
+                message="相同请求的装卸时段更正已存在，重传返回原结果（幂等）",
+            ).model_dump(mode="json"),
+        )
+    return ack
+
+
+@app.get(
+    "/trips/{trip_id}/loading-corrections",
+    response_model=LoadingCorrectionHistory,
+    tags=["装卸时段更正"],
+    responses={
+        404: {"description": "车次不存在"},
+        422: {"description": "缺少 origin_loaded_at / 时刻非法或无时区"},
+    },
+)
+def list_loading_corrections(
+    trip_id: str,
+    cargo_id: str,
+    origin_loaded_at: str | None = None,
+    db: Session = Depends(get_db),
+) -> LoadingCorrectionHistory:
+    """一条装卸窗口的原始 / 当前窗口与历次更正（按版本升序，append-only）。
+
+    窗口由车次（路径）+ ``cargo_id`` + ``origin_loaded_at``（首次登记装车
+    时刻）按稳定身份定位。窗口不存在（车次存在但无此窗口）时返回
+    ``window_exists=false``、空更正列表与版本 0。
+    """
+    origin = _parse_origin_loaded_at(origin_loaded_at)
+    if db.get(Trip, trip_id) is None:
+        raise crud.ApiError(404, "trip_not_found", f"车次 {trip_id} 不存在")
+
+    loading = loading_correction_crud.get_current_loading(
+        db, trip_id, cargo_id, origin
+    )
+    rows = loading_correction_crud.load_window_corrections(
+        db, trip_id, cargo_id, origin
+    )
+    corrections = [_loading_correction_out(r) for r in rows]
+
+    if loading is None:
+        return LoadingCorrectionHistory(
+            trip_id=trip_id,
+            cargo_id=cargo_id,
+            origin_loaded_at=origin,
+            window_exists=False,
+            origin_unloaded_at=None,
+            loaded_at=None,
+            unloaded_at=None,
+            version=0,
+            corrections=[],
+        )
+
+    # 当前版本优先取 loading 行的 window_version；无 loading 行版本列的兜底
+    # 取最新一条更正（二者在同一事务内维护，正常恒一致）
+    version = loading.window_version or (rows[-1].version if rows else 0)
+    return LoadingCorrectionHistory(
+        trip_id=trip_id,
+        cargo_id=cargo_id,
+        origin_loaded_at=origin,
+        window_exists=True,
+        origin_unloaded_at=ensure_utc(loading.origin_unloaded_at),
+        loaded_at=ensure_utc(loading.loaded_at),
+        unloaded_at=ensure_utc(loading.unloaded_at),
+        version=version,
+        corrections=corrections,
     )
 
 

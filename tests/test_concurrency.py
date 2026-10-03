@@ -304,3 +304,84 @@ def test_concurrent_own_event_correction_and_event_write_serialize(client):
     assert len(hist["corrections"]) == 1
     assert hist["version"] == 1
     assert client.get("/cargo/COC/report").json()["excursions"] == []
+
+
+def test_concurrent_loading_correction_and_event_write_serialize(client):
+    """装卸时段更正与该货物事件写入共用货物行锁，必须串行。
+
+    同一窗口并发提交 8 笔相同更正（expected_version=0）：一笔 201，
+    其余按幂等返回 200；当前窗口只被更新一次，版本恰好为 1，车次修订号
+    只 +1。另并发写入该货物事件，不得出现损坏 / 5xx。
+    """
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CLC",
+            "started_at": "2026-01-01T10:00:00+00:00",
+            "temp_upper_limit": "5",
+            "initial_holder": "A",
+        },
+    )
+    assert client.post(
+        "/trips", json={"trip_id": "TLC", "vehicle_no": "V"}
+    ).status_code == 201
+    assert client.post(
+        "/trips/TLC/manifest",
+        json={"items": [{
+            "cargo_id": "CLC",
+            "loaded_at": "2026-01-01T10:00:00+00:00",
+            "unloaded_at": "2026-01-01T12:00:00+00:00",
+        }]},
+    ).status_code == 201
+    revision_after_manifest = client.get("/trips/TLC").json()["revision"]
+
+    def submit_correction(i):
+        return client.post(
+            "/trips/TLC/loading-corrections",
+            json={
+                "correction_id": "lc-same",
+                "cargo_id": "CLC",
+                "origin_loaded_at": "2026-01-01T10:00:00+00:00",
+                "expected_version": 0,
+                "new_loaded_at": "2026-01-01T11:00:00+00:00",
+                "new_unloaded_at": "2026-01-01T13:00:00+00:00",
+                "reason": "并发同一更正",
+            },
+        ).status_code
+
+    def submit_event(i):
+        return client.post(
+            "/events",
+            json={
+                "event_id": f"ev-{i}",
+                "cargo_id": "CLC",
+                "occurred_at": f"2026-01-01T15:{i:02d}:00+00:00",
+                "giver": "A",
+                "receiver": f"P{i}",
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        corr_codes = list(pool.map(submit_correction, range(8)))
+        event_codes = list(pool.map(submit_event, range(4)))
+
+    assert corr_codes.count(201) == 1
+    assert corr_codes.count(200) == 7
+    # 同货物事件写入与更正经货物行锁串行：全部成功（各不同时刻的合法交接链）
+    # 第一笔交接 A->P0 之后，后续 A 交出会 giver_mismatch——这里只要求无 5xx，
+    # 且最终保管链自洽。
+    assert all(code in (201, 422) for code in event_codes)
+
+    detail = client.get("/trips/TLC").json()
+    loading = detail["loadings"][0]
+    assert loading["loaded_at"] == "2026-01-01T11:00:00Z"
+    assert loading["window_version"] == 1
+    assert detail["revision"] == revision_after_manifest + 1
+    hist = client.get(
+        "/trips/TLC/loading-corrections",
+        params={
+            "cargo_id": "CLC",
+            "origin_loaded_at": "2026-01-01T10:00:00+00:00",
+        },
+    ).json()
+    assert len(hist["corrections"]) == 1

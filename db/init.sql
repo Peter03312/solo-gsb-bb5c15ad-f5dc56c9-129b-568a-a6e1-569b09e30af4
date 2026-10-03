@@ -65,19 +65,27 @@ CREATE TABLE IF NOT EXISTS trip (
     created_at   TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
 
--- 一票货物在一个车次上的装卸时段：左闭右开 [loaded_at, unloaded_at)
+-- 一票货物在一个车次上的装卸窗口。
+-- 稳定身份（更正永不改变）：(trip_id, cargo_id, origin_loaded_at)——车次、货物与
+-- 首次登记装车时刻；loaded_at/unloaded_at 保存“当前有效窗口”（更正就地更新），
+-- origin_* 保存首次登记的原始窗口（append-only 留痕），window_version 为更正
+-- 版本（0=原始，乐观锁）。当前窗口仍为左闭右开 [loaded_at, unloaded_at)。
 CREATE TABLE IF NOT EXISTS loading (
-    trip_id      VARCHAR(64)   NOT NULL
-                     REFERENCES trip(trip_id) ON DELETE RESTRICT,
-    cargo_id     VARCHAR(64)   NOT NULL
-                     REFERENCES cargo(cargo_id) ON DELETE RESTRICT,
-    loaded_at    TIMESTAMPTZ   NOT NULL,
-    unloaded_at  TIMESTAMPTZ   NOT NULL,
-    created_at   TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    trip_id             VARCHAR(64)   NOT NULL
+                          REFERENCES trip(trip_id) ON DELETE RESTRICT,
+    cargo_id            VARCHAR(64)   NOT NULL
+                          REFERENCES cargo(cargo_id) ON DELETE RESTRICT,
+    origin_loaded_at    TIMESTAMPTZ   NOT NULL,   -- 稳定身份：首次登记装车时刻
+    loaded_at           TIMESTAMPTZ   NOT NULL,   -- 当前窗口起点（含）
+    unloaded_at         TIMESTAMPTZ   NOT NULL,   -- 当前窗口终点（不含）
+    origin_unloaded_at  TIMESTAMPTZ   NOT NULL,   -- 首次登记卸车时刻（留痕）
+    window_version      INTEGER       NOT NULL DEFAULT 0,
+    created_at          TIMESTAMPTZ   NOT NULL DEFAULT now(),
 
-    -- 左闭右开且起点严格早于终点
+    -- 当前窗口与原始窗口都左闭右开且起点严格早于终点
     CONSTRAINT chk_loading_window CHECK (loaded_at < unloaded_at),
-    PRIMARY KEY (trip_id, cargo_id, loaded_at)
+    CONSTRAINT chk_loading_origin_window CHECK (origin_loaded_at < origin_unloaded_at),
+    PRIMARY KEY (trip_id, cargo_id, origin_loaded_at)
 );
 
 CREATE INDEX IF NOT EXISTS ix_loading_cargo
@@ -194,3 +202,41 @@ CREATE INDEX IF NOT EXISTS ix_correction_event
 
 CREATE INDEX IF NOT EXISTS ix_correction_reading
     ON temperature_correction (target_reading_id, created_at, correction_id);
+
+-- 装卸时段更正（append-only：原始窗口留痕，当前窗口在 loading 表就地更新）。
+-- 只改一条装卸窗口的时间，车次/货物归属与稳定身份（origin_loaded_at）不变。
+CREATE TABLE IF NOT EXISTS loading_correction (
+    correction_id          VARCHAR(64)   PRIMARY KEY,
+    -- 被更正窗口的稳定身份（车次 + 货物 + 首次登记装车时刻，不可变）
+    trip_id                VARCHAR(64)   NOT NULL,
+    cargo_id               VARCHAR(64)   NOT NULL,
+    origin_loaded_at       TIMESTAMPTZ   NOT NULL,
+    -- 首次登记时的原始窗口（历次更正一致，仅留痕）
+    origin_unloaded_at     TIMESTAMPTZ   NOT NULL,
+    -- 更正前一刻的窗口（本次更正所改的旧窗口）
+    previous_loaded_at     TIMESTAMPTZ   NOT NULL,
+    previous_unloaded_at   TIMESTAMPTZ   NOT NULL,
+    -- 更正后的新窗口
+    new_loaded_at          TIMESTAMPTZ   NOT NULL,
+    new_unloaded_at        TIMESTAMPTZ   NOT NULL,
+    -- 乐观锁：提交时该窗口的当前更正版本（首次为 0）；更正后的版本（=期望值+1）
+    expected_version       INTEGER       NOT NULL,
+    version                INTEGER       NOT NULL,
+    reason                 VARCHAR(512)  NOT NULL,
+    created_at             TIMESTAMPTZ   NOT NULL DEFAULT now(),
+
+    CONSTRAINT chk_loading_correction_shape CHECK (
+        expected_version >= 0
+        AND version >= 1
+        AND new_loaded_at < new_unloaded_at
+        AND origin_loaded_at < origin_unloaded_at
+        AND char_length(reason) > 0
+    )
+);
+
+-- 每个被更正窗口下版本号唯一（应用侧在货物行锁 + 车次行锁内按序号分配）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_loading_correction_window_version
+    ON loading_correction (trip_id, cargo_id, origin_loaded_at, version);
+
+CREATE INDEX IF NOT EXISTS ix_loading_correction_window
+    ON loading_correction (trip_id, cargo_id, origin_loaded_at, created_at);

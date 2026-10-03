@@ -150,16 +150,28 @@ class Trip(Base):
 
 
 class Loading(Base):
-    """一票货物在一个车次上的装载记录：装卸时段 ``[loaded_at, unloaded_at)``。
+    """一票货物在一个车次上的装载记录。
 
-    左闭右开：读数时刻等于 loaded_at 时在车上，等于 unloaded_at 时已不在车上。
-    同一货物的装卸时段不得跨车次重叠（应用侧在货物行锁内校验，保证并发一致）。
-    主键为 (trip_id, cargo_id, loaded_at)：同车次同货物可有多段（分段承运）。
+    稳定身份（更正永不改变）：``(trip_id, cargo_id, origin_loaded_at)``——
+    车次、货物与**首次登记时的装车时刻**共同定位“这一条装卸窗口”。
+    ``loaded_at`` / ``unloaded_at`` 保存**当前有效窗口**（更正就地更新这两列），
+    ``origin_loaded_at`` / ``origin_unloaded_at`` 保存首次登记的原始窗口
+    （append-only 可追溯）；``window_version`` 为该条窗口的更正版本
+    （0=原始，每成功更正一次 +1），作为装卸时段更正的乐观锁。
+
+    当前窗口仍为左闭右开 ``[loaded_at, unloaded_at)``：读数时刻等于 loaded_at
+    时在车上，等于 unloaded_at 时已不在车上。同一货物任意车次的**当前窗口**
+    不得重叠（应用侧在货物行锁内校验，保证并发一致）。更正只改当前窗口，
+    不改车次 / 货物归属与稳定身份。
     """
 
     __tablename__ = "loading"
     __table_args__ = (
         CheckConstraint("loaded_at < unloaded_at", name="chk_loading_window"),
+        CheckConstraint(
+            "origin_loaded_at < origin_unloaded_at",
+            name="chk_loading_origin_window",
+        ),
         Index("ix_loading_cargo", "cargo_id", "loaded_at", "unloaded_at"),
     )
 
@@ -173,11 +185,24 @@ class Loading(Base):
         ForeignKey("cargo.cargo_id", ondelete="RESTRICT"),
         primary_key=True,
     )
-    loaded_at: Mapped[datetime] = mapped_column(
+    # 稳定身份：首次登记时的装车时刻（更正不改），与车次/货物共同作主键
+    origin_loaded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), primary_key=True
+    )
+    # 当前有效窗口（更正就地更新）
+    loaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
     )
     unloaded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
+    )
+    # 首次登记时的原始卸车时刻（仅留痕，不参与适用性判断）
+    origin_unloaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # 该条窗口的更正版本：0=原始登记，n>=1=已更正 n 次（乐观锁）
+    window_version: Mapped[int] = mapped_column(
+        nullable=False, default=0, server_default="0"
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -358,6 +383,85 @@ class TemperatureCorrection(Base):
     new_temperature: Mapped[Decimal] = mapped_column(
         Numeric(10, 3), nullable=False
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class LoadingCorrection(Base):
+    """装卸时段更正（append-only）：只改一条装卸窗口的时间，归属与稳定身份不变。
+
+    稳定身份由 ``(trip_id, cargo_id, origin_loaded_at)`` 给出——车次、货物与
+    **首次登记时的装车时刻**；历次更正沿用同一身份，原始窗口经
+    ``origin_loaded_at`` / ``origin_unloaded_at`` 留痕。更正只把对应 loading
+    行的当前窗口（``loaded_at`` / ``unloaded_at``）就地更新，车次 / 货物归属
+    与稳定身份永不改变。
+
+    ``expected_version`` 为乐观锁：必须等于提交时该窗口的当前更正版本
+    （首次更正为 0，随后依次递增）；``version`` 为本次更正后的版本
+    （= expected_version + 1，也等于该窗口下更正的写入序号）。
+    新窗口仍左闭右开且起点严格早于终点；按“同一货物在任意车次的当前时段
+    不得重叠”校验时排除该条旧窗口本身，冲突整次拒绝、不留部分变更。
+    成功落库时同事务把该车次修订号 +1（旧装卸预检摘要随之失效）。
+    """
+
+    __tablename__ = "loading_correction"
+    __table_args__ = (
+        CheckConstraint(
+            "expected_version >= 0 AND version >= 1 "
+            "AND new_loaded_at < new_unloaded_at "
+            "AND origin_loaded_at < origin_unloaded_at "
+            "AND reason IS NOT NULL AND char_length(reason) > 0",
+            name="chk_loading_correction_shape",
+        ),
+        # 每个被更正窗口下版本号唯一（应用侧在货物行锁 + 车次行锁内按序号分配）
+        Index(
+            "ux_loading_correction_window_version",
+            "trip_id",
+            "cargo_id",
+            "origin_loaded_at",
+            "version",
+            unique=True,
+        ),
+        Index(
+            "ix_loading_correction_window",
+            "trip_id",
+            "cargo_id",
+            "origin_loaded_at",
+            "created_at",
+        ),
+    )
+
+    correction_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # 被更正窗口的稳定身份（车次 + 货物 + 首次登记装车时刻，均不可变）
+    trip_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    cargo_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    origin_loaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # 首次登记时的原始窗口（留痕，历次更正一致）
+    origin_unloaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # 更正前一刻的窗口（本次更正所改的“旧窗口”）
+    previous_loaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    previous_unloaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # 更正后的新窗口（当前窗口的来源；最新一条 version 即当前）
+    new_loaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    new_unloaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    expected_version: Mapped[int] = mapped_column(nullable=False)
+    version: Mapped[int] = mapped_column(nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

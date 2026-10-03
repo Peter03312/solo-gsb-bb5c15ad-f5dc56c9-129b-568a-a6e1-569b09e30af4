@@ -2,7 +2,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models import CorrectionTarget, EventType, StanceKind
 
@@ -342,8 +342,22 @@ class LoadingOut(BaseModel):
 
     trip_id: str
     cargo_id: str
-    loaded_at: datetime
-    unloaded_at: datetime
+    origin_loaded_at: datetime = Field(
+        ...,
+        description="首次登记装车时刻：该条装卸窗口的稳定身份（更正不改），"
+        "更正时以此与车次、货物共同定位旧窗口",
+    )
+    loaded_at: datetime = Field(
+        ..., description="当前窗口起点（含；装卸时段更正后为修正值）"
+    )
+    unloaded_at: datetime = Field(
+        ..., description="当前窗口终点（不含；装卸时段更正后为修正值）"
+    )
+    window_version: int = Field(
+        ...,
+        description="该条装卸窗口的更正版本：0=原始登记，n>=1 表示已更正 n 次；"
+        "更正请求的 expected_version 取此值",
+    )
 
 
 class ManifestOut(BaseModel):
@@ -707,5 +721,121 @@ class CorrectionHistory(BaseModel):
     )
     version: int = Field(..., description="当前更正版本（无更正 / 目标不存在为 0）")
     corrections: list[CorrectionHistoryItem] = Field(
+        ..., description="历次更正（append-only），按版本升序"
+    )
+
+
+# ----------------------------------------------------- 装卸时段更正
+
+
+class LoadingWindowCorrectionCreate(BaseModel):
+    """装卸时段更正提交：只改一条装卸窗口的时间，车次 / 货物归属不变。
+
+    被更正窗口由 ``cargo_id`` + ``origin_loaded_at``（首次登记装车时刻，车次
+    取自路径）按稳定身份定位；``expected_version`` 为该窗口当前更正版本
+    （首次更正为 0，取车次详情中该窗口的 ``window_version``）。三个时刻均须
+    携带时区偏移；新窗口左闭右开且起点严格早于终点。
+    """
+
+    correction_id: str = Field(
+        ..., min_length=1, max_length=64, description="更正编号（客户端指定）"
+    )
+    cargo_id: str = Field(..., min_length=1, max_length=64, description="货物编号")
+    origin_loaded_at: datetime = Field(
+        ...,
+        description="原车次上该条窗口**首次登记的装车时刻**（稳定身份，须带时区）",
+    )
+    expected_version: int = Field(
+        ...,
+        ge=0,
+        description="预期的该窗口当前更正版本（首次更正为 0，"
+        "随后取车次详情中的 window_version）；不一致则拒绝（版本过期）",
+    )
+    new_loaded_at: datetime = Field(
+        ..., description="修正后的装车时刻（新窗口起点，含；须带时区）"
+    )
+    new_unloaded_at: datetime = Field(
+        ..., description="修正后的卸车时刻（新窗口终点，不含；须带时区）"
+    )
+    reason: str = Field(
+        ..., min_length=1, max_length=512, description="更正原因（必填非空）"
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("更正原因 reason 不能为空白")
+        return value.strip()
+
+
+class LoadingCorrectionOut(BaseModel):
+    """一条装卸时段更正记录（append-only）。"""
+
+    correction_id: str
+    trip_id: str
+    cargo_id: str
+    origin_loaded_at: datetime = Field(
+        ..., description="被更正窗口的稳定身份：首次登记装车时刻（不可变）"
+    )
+    origin_unloaded_at: datetime = Field(
+        ..., description="首次登记卸车时刻（原始窗口，留痕）"
+    )
+    previous_loaded_at: datetime = Field(
+        ..., description="更正前一刻的窗口起点（本次所改的旧窗口起点）"
+    )
+    previous_unloaded_at: datetime = Field(
+        ..., description="更正前一刻的窗口终点（本次所改的旧窗口终点）"
+    )
+    new_loaded_at: datetime = Field(..., description="更正后的窗口起点（含）")
+    new_unloaded_at: datetime = Field(..., description="更正后的窗口终点（不含）")
+    expected_version: int
+    version: int = Field(..., description="本次更正后的版本（= expected_version + 1）")
+    reason: str
+    created_at: datetime
+
+
+class LoadingCorrectionAck(BaseModel):
+    """装卸时段更正回执：更正记录 + 更正后该窗口的当前窗口 / 版本。"""
+
+    correction: LoadingCorrectionOut
+    loaded_at: datetime = Field(..., description="更正后该窗口的当前起点（含）")
+    unloaded_at: datetime = Field(..., description="更正后该窗口的当前终点（不含）")
+    origin_loaded_at: datetime
+    origin_unloaded_at: datetime
+    version: int = Field(..., description="更正后该窗口的当前版本")
+    affected_cargo_ids: list[str] = Field(
+        ...,
+        description="受影响货物：装卸时段更正只作用于该窗口所属货物，恒为单元素列表",
+    )
+
+
+class LoadingCorrectionReplay(LoadingCorrectionAck):
+    """同更正编号同请求重传：返回原结果（幂等）。"""
+
+    replayed: bool = True
+    message: str
+
+
+class LoadingCorrectionHistory(BaseModel):
+    """一条装卸窗口的当前/原始窗口与历次更正（按版本升序）。"""
+
+    trip_id: str
+    cargo_id: str
+    origin_loaded_at: datetime = Field(
+        ..., description="被查询窗口的稳定身份：首次登记装车时刻"
+    )
+    window_exists: bool = Field(..., description="该装卸窗口当前是否存在")
+    origin_unloaded_at: datetime | None = Field(
+        ..., description="首次登记卸车时刻（原始窗口）；窗口不存在时为 null"
+    )
+    loaded_at: datetime | None = Field(
+        ..., description="当前窗口起点（含）；窗口不存在时为 null"
+    )
+    unloaded_at: datetime | None = Field(
+        ..., description="当前窗口终点（不含）；窗口不存在时为 null"
+    )
+    version: int = Field(..., description="当前更正版本（无更正 / 窗口不存在为 0）")
+    corrections: list[LoadingCorrectionOut] = Field(
         ..., description="历次更正（append-only），按版本升序"
     )
